@@ -1,62 +1,93 @@
-# Reaper MIDI Insert with Local BPM
+# Reaper Local BPM
 
-A ReaScript for Cockos REAPER that resolves a native MIDI initialization issue when working within projects configured with a "Time" timebase.
+A ReaScript for Cockos REAPER that makes MIDI items respect the **local tempo and time signature** at their timeline position — in projects where REAPER's native behavior ignores them.
+
+Two tools in a single action:
+
+- **Insert** — creates a blank MIDI item across the active time selection with the local BPM and time signature baked in.
+- **Rebuild** — fixes *existing* MIDI items whose internal grid runs at the wrong tempo, keeping every note at its exact audible position.
+
+Both paths can fire in one invocation.
 
 ## The Problem
 
-When a REAPER project timebase is set to **Time**, drawing or inserting a new MIDI item natively via `Insert > New MIDI item` or mouse modifiers causes the item to ignore the local tempo and time signature markers at its physical timeline position. Instead, the item initializes using the project's global default statistics (typically found at Bar 1, Beat 1). 
+REAPER projects configured with a **Time** timebase have two long-standing quirks:
 
-While SWS extension actions can manually force an item to "Ignore project tempo," applying this to an unedited, blank project-native container is unstable. With default settings Attions make no effect, and if (Preferences -> MIDI) `Create new MIDI items as:` `.MID files` , is enabled, closing the MIDI piano roll editor without explicitly saving causes the item boundaries to shrink, notes to offset, or the layout engine to render a repetitive wall of frequent loop notches across the block. Unusable.
+**1. New MIDI items ignore local tempo.**
+`Insert > New MIDI item` (and mouse-modifier equivalents) initialize the item with the project's global default statistics instead of the tempo and time signature markers at its physical position. The SWS "ignore project tempo" workaround is unstable when applied to a blank project-native container: with `Create new MIDI items as: .MID files` enabled, closing the piano roll without saving shrinks the item, offsets notes, or renders a wall of loop notches across the block.
+
+**2. Existing items can't change their baked tempo.**
+A MIDI take's tempo is fixed when the take is created, and there is no API to change it afterwards. Drag an item from a 92 BPM region into a 162 BPM region and its grid still runs at 92 — the editor grid is wrong and notes sit at meaningless bar:beat positions.
 
 ## The Solution
 
-This script automates a stable workaround by bypassing blank internal MIDI item initialization:
-1. **Binary Asset Generation:** Compiles a compliant SMF Type 0 binary block in the system cache with local BPM/time signature parameters, matching active user preferences for **Ticks per quarter note** (`miditicksperqn`) and **CC segment interpolation resolution** (`midiccinterpres`).
-2. **External File Import:** Injects the cache file via `reaper.InsertMedia` to be evaluated as an isolated external asset.
-3. **Database Reconstruction:** Forces a timebase override (`C_BEATATTACHMODE = 0`), converts the asset to an internal take, caches the track's original automation state, applies the layout glue routine (`41588`), and restores the track automation mode to prevent unwanted overrides.
-4. **Adaptive Integration & Renaming:** Formats the take using two-digit track lane indicators (e.g., `01`, `02`) and automated naming (`XX-TrackName-MIDI` or `XX-MIDI`), while preventing unnamed tracks from inheriting temporary file names.
+Both problems get the same cure: a compliant SMF (Standard MIDI File) containing the correct local tempo and time signature meta-events is compiled in a temp cache, imported as an external asset, and run through a stabilization chain — `timebase = Time → SWS ignore-tempo → convert to in-project → glue` — which forces REAPER to bake the local tempo and time signature into the take. PPQ resolution follows your `miditicksperqn` preference; new-track automation follows `launchnewtrkmode`.
 
-The resulting MIDI block features a clean timeline grid matching local arrangement, zero loops, and complete structural stability if closed without saving. No ghost notes are added.
+- **Insert path:** the imported file *is* the item — a clean, correctly gridded blank MIDI block, structurally stable when closed unsaved, with edge-drag looping active and two-digit take naming (`NN-MIDI` / `NN-TrackName-MIDI`).
+- **Rebuild path:** before the swap, every note, CC, text and sysex event of the original item is captured as an *audible timeline position*. After the rebuild, the events are re-injected through the finished take's own PPQ↔time mapping — the grid now runs at the local BPM while playback stays identical (a built-in verification measures the drift of every note, before the optional grid snap cleans up the fractional ticks left by non-integer tempo ratios).
 
+Loops survive: a looped item is rebuilt as one corrected iteration, then the item's length and loop flag are restored — including partial final iterations. Items that already conform to the local tempo are detected and left untouched, so the action is safe on mass selections and safe to run twice.
+
+## Requirements
+
+- REAPER v6.0 or newer (Lua ReaScript support)
+- SWS / S&M Extension
 
 ## Installation
 
-### Prerequisites
-* **REAPER v6.0 or newer** (configured with Lua 5.3+ support)
-* **SWS / S&M Extension** installed (required for the metadata isolation command)
-
-### Setup Steps
 1. Open REAPER.
-2. Open the Action List by pressing `?` or navigating to `Actions > Show action list`.
-3. In the bottom right corner, click **ReaScript: New...**.
-4. Set the file name to `Reaper-MIDI-Insert-With-Local-BPM` (or any other) and click **Save**.
-5. Copy the full source code from the `.lua` file in this repository and paste it into the built-in development environment editor.
-6. Press `Ctrl + S` (Windows) or `Cmd + S` (macOS) to save, then close the script window.
+2. Open the Action List (`?` or `Actions > Show action list`).
+3. Click **ReaScript: New...** in the bottom right corner.
+4. Set the file name to `Reaper-Local-BPM` (or any other) and click **Save**.
+5. Copy the full source code from the `.lua` file in this repository, paste it into the editor, and save (`Ctrl+S` / `Cmd+S`).
 
 ## Usage
 
 ### Hotkey Mapping
 Locate the registered script in your Action List, select it, and assign it to a custom keyboard shortcut or layout button.
 
-### Mouse Modifier Mapping (Recommended)
-Because REAPER strictly limits drag behaviors (`left drag` or `right drag`) to hardcoded internal marquee functions, custom actions and scripts cannot be mapped directly to a drag gesture. Instead, the script can be assigned to a modifier click that reads your active time selection for quick use.
+### Insert a blank item
+1. Draw a **time selection** over the target region.
+2. Run the action.
 
-To configure this workflow:
-1. Navigate to `Options > Preferences > Editing Behavior > Mouse Modifiers`.
-2. Set the **Context** dropdowns to `Track` and `left click`.
-3. Double-click your desired modifier row (e.g., `Shift`).
-4. Select `Action list...` from the very bottom of the pop-up menu.
-5. Search for `Script: Reaper-MIDI-Insert-With-Local-BPM.lua`, select it, and click **Select/Close**.
-6. Click **Apply** and close the preferences menu.
+With a track selected, the item is created on that track. With no track selected, a new track is spawned at the end of the track list.
 
-### Working Method
-1. Draw your standard **Time Selection** bounding box across the timeline over the target grid region (e.g., using `Ctrl + Right-Drag` or your default arrangement tool).
-2. Release the mouse drag, hold your mapped modifier (e.g., `Ctrl`), and **Left-Click** once anywhere inside the target track lane.
-3. The script fires instantly, reading the boundaries of your selection and populating it with the stabilized local MIDI pattern block.
+### Rebuild existing items
+1. **Select one or more MIDI items.**
+2. Run the action.
 
+Items whose internal tempo doesn't match the local tempo are rebuilt — notes keep their audible positions. Items that already conform are skipped untouched. Looped items keep their loops.
 
-Now, dragging a time selection box with your chosen right-click modifier will instantly populate the timeline with a perfectly scaled, grid-accurate local MIDI pattern block.
+### Both at once
+With items selected *and* a time selection active, both paths run in a single invocation: the selected items are rebuilt, and a blank local item is inserted.
+
+## Behavior & Configuration
+
+The script is silent by default — no console output during a clean run. Hard failures (event injection failure, tempo bake not sticking, note drift) always print an `ERROR:` line so nothing fails silently. Set `verbose = true` in the script's `CONFIG` table for a full diagnostic report: per-item old/new grid BPM, tempo ratio, injected event counts, measured note drift, and loop verification.
+
+Notable `CONFIG` options (all documented inline):
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `check_meter` | `false` | Rebuild only on tempo mismatch. Leave off for polyrhythm workflows that deliberately mix meters within a bar; set `true` to also fix baked time signatures. |
+| `quantize` | `"grid"` | Post-rebuild snap: `"grid"` (MIDI editor grid), `"tick"` (whole ticks only, sub-0.05 ms movement), or `"off"`. |
+| `preserve_loops` | `true` | Rebuild looped items as one corrected iteration and restore the loop afterwards. |
+| `skip_if_conforms` | `true` | Leave items already matching the local tempo completely untouched. |
+| `insert_when_no_track_selected` | `true` | The insert path spawns a new track when no track is selected. |
+| `consume_selection_after_insert` | `false` | Restore the time selection after an insert. |
+| `use_glue` | `true` | **Leave on** — the glue step is required for the tempo bake to survive the import chain. |
+
+## Known Limitations
+
+- Items with multiple takes are skipped (glue to a single take first).
+- Looped items that are split pieces sharing a MIDI source (non-zero take offset) are skipped — glue them manually first.
+- Notes, CCs (including bezier shapes), text, sysex and per-event mute state are carried across a rebuild; item fades and take envelopes are not.
+- The rebuild path is tempo-only by default (see `check_meter`); the insert path always bakes the local time signature for new items.
 
 ## License
 
-This project is licensed under the Mozilla Public License 2.0 (MPL-2.0). See the LICENSE file for details.
+This project is licensed under the Mozilla Public License 2.0 (MPL-2.0). See [LICENSE](LICENSE) for details.
+
+## About
+
+Built for Time-timebase projects where local tempo regions are the norm, not the exception: create new MIDI on the correct grid, and rescue items that were drawn on the wrong one.
