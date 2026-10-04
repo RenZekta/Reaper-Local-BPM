@@ -17,8 +17,14 @@
         timeline position (re-measured afterwards; drift is reported)
       * looped items are rebuilt as ONE corrected iteration, then the
         loop is restored - including a partial final iteration
-      * items that already conform to the local tempo are left
-        completely untouched (safe on mass selections, safe to re-run)
+      * playback-rate compensations are normalized: the effective rate
+        is item D_PLAYRATE x take D_PLAYRATE (changing a MIDI item's
+        BPM via item properties stores the compensation in the TAKE
+        rate), and any item whose rate differs from 1.0 is rebuilt at
+        the local tempo with rate 1.0 - audible positions preserved
+      * items that already conform (effective grid = local tempo, rate
+        1.0) are left completely untouched - safe on mass selections,
+        safe to re-run
       * an optional grid-snap pass cleans the fractional ticks left
         by non-integer tempo ratios
     Items with multiple takes, and looped split pieces sharing a MIDI
@@ -51,12 +57,15 @@
     the end of the run.
 
   CONFIGURATION: see the CONFIG table below. Notables:
-    verbose (default false)     fully silent except ERROR lines;
-                                true = full per-item diagnostic report
-    check_meter (default false) rebuild on tempo mismatch only; leave
-                                off for polyrhythm workflows that
-                                deliberately mix meters within a bar
-    quantize (default "grid")   post-rebuild snap: "grid", "tick", off
+    verbose (default false)        fully silent except ERROR lines;
+                                   true = full per-item diagnostic report
+    normalize_playrate (true)      rebuild items carrying a playback-
+                                   rate compensation so they run at
+                                   rate 1.0 (audible positions kept)
+    check_meter (default false)    rebuild on tempo mismatch only; leave
+                                   off for polyrhythm workflows that
+                                   deliberately mix meters within a bar
+    quantize (default "grid")      post-rebuild snap: "grid", "tick", off
 
   Everything runs inside a single undo point. Original items are only
   deleted after the rebuilt item is verified, so a failed rebuild
@@ -68,6 +77,9 @@ local CONFIG = {
   skip_if_conforms = true,
   force_rebuild    = false,
   check_meter      = false,   -- tempo-only by default; true = also fix meter
+  normalize_playrate = true,  -- rebuild items with a playback-rate
+                              -- compensation (rate != 1.0), normalizing
+                              -- them to the local tempo at rate 1.0
   use_glue         = true,    -- REQUIRED, see header
   preserve_loops   = true,
   quantize         = "grid",  -- "grid" | "tick" | "off"
@@ -110,6 +122,24 @@ local function tptr_ok(track)
   if track == nil then return false end
   if reaper.ValidatePtr then return reaper.ValidatePtr(track, "MediaTrack*") end
   return true
+end
+
+-- Effective playback rate of a MIDI item.
+-- REAPER stores MIDI tempo compensations on the TAKE's D_PLAYRATE (the
+-- item-level read can return 0 - an impossible real value - on some
+-- builds/items). Each read is validated independently; an invalid read
+-- falls back to 1.0 BEFORE multiplying, so a bad item-level read can
+-- never mask a valid take-level rate (the v17 bug).
+local function GetEffectiveRate(item, take)
+  local ipr_raw = reaper.GetMediaItemInfo_Value(item, "D_PLAYRATE")
+  local ipr = (type(ipr_raw) == "number" and ipr_raw > 0 and ipr_raw <= 100.0)
+              and ipr_raw or 1.0
+  local tpr = 1.0
+  if reaper.GetMediaItemTakeInfo_Value then
+    local v = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
+    if type(v) == "number" and v > 0 and v <= 100.0 then tpr = v end
+  end
+  return ipr * tpr, ipr, tpr
 end
 
 -- create a new track at the end of the track list and select it
@@ -187,6 +217,8 @@ local function GetLocalTempoAtTime(t)
   return bpm, num, den
 end
 
+-- effective grid BPM (baked tempo x effective rate), via the take's own
+-- PPQ<->time mapping
 local function TakeGridBPM(take)
   local t0 = reaper.MIDI_GetProjTimeFromPPQPos(take, 0)
   local t1 = reaper.MIDI_GetProjTimeFromPPQPos(take, 960)
@@ -194,9 +226,16 @@ local function TakeGridBPM(take)
   return nil
 end
 
-local function TakeConforms(take, pos, lbpm, lnum, lden, R, old_bpm)
+local function TakeConforms(take, pos, lbpm, lnum, lden, R, old_bpm, eff_rate)
   if math.abs(old_bpm / lbpm - 1.0) > CONFIG.tolerance then
     return false, string.format("tempo %.3f vs local %.3f", old_bpm, lbpm)
+  end
+  if CONFIG.normalize_playrate and math.abs(eff_rate - 1.0) > CONFIG.tolerance then
+    -- effective grid matches the local tempo, but a playback-rate
+    -- compensation remains (baked tempo differs) - normalize it
+    return false, string.format(
+      "tempo matches, but playback rate %.4f (baked ~%.3f BPM) - normalizing to rate 1.0",
+      eff_rate, old_bpm / eff_rate)
   end
   if CONFIG.check_meter and reaper.MIDI_GetPPQPos_StartOfMeasure
      and reaper.MIDI_GetPPQPos_EndOfMeasure then
@@ -216,7 +255,7 @@ local function TakeConforms(take, pos, lbpm, lnum, lden, R, old_bpm)
       return true, string.format("tempo + meter match (%.2f QN/bar)", baked_qn)
     end
   end
-  return true, "tempo matches (meter check off or not probeable)"
+  return true, "tempo matches, rate 1.0"
 end
 
 local function BuildBlankSMF(bpm, num, den, item_len, R)
@@ -247,32 +286,32 @@ end
 
 local function AnalyzeLoop(item, take, len)
   local loopsrc_on = reaper.GetMediaItemInfo_Value(item, "B_LOOPSRC") == 1
-  local pr_raw = reaper.GetMediaItemInfo_Value(item, "D_PLAYRATE") or 1.0
-  local pr = (pr_raw and pr_raw >= 0.01 and pr_raw <= 100.0) and pr_raw or 1.0
+  local eff, ipr, tpr = GetEffectiveRate(item, take)
   local slen = 0
   local src = reaper.GetMediaItemTake_Source(take)
   if src then slen = reaper.GetMediaSourceLength(src) or 0 end
 
-  local audible_iter = (slen > 0.05) and (slen / pr) or nil
+  local audible_iter = (slen > 0.05) and (slen / eff) or nil
   local is_looped = loopsrc_on and audible_iter ~= nil
                     and audible_iter < len - 0.05
 
   local diag
   if is_looped then
     diag = string.format(
-      "loop: source %.3fs @ playrate %.3f -> one iteration %.3fs;" ..
-      " item %.3fs = %.2f iterations (partial %.3fs)",
-      slen, pr, audible_iter, len, len / audible_iter, len % audible_iter)
+      "loop: source %.3fs @ playrate %.4f (item %.3f x take %.3f) -> one" ..
+      " iteration %.3fs; item %.3fs = %.2f iterations (partial %.3fs)",
+      slen, eff, ipr, tpr, audible_iter, len, len / audible_iter,
+      len % audible_iter)
   elseif loopsrc_on then
     if audible_iter == nil then
       diag = string.format(
         "loop: B_LOOPSRC on but source length unreadable (%.3fs)," ..
-        " playrate %.3f - rebuilding unlooped", slen, pr_raw)
+        " playrate %.4f - rebuilding unlooped", slen, eff)
     else
       diag = string.format(
-        "loop: B_LOOPSRC on but the source (%.3fs audible, playrate %.3f)" ..
+        "loop: B_LOOPSRC on but the source (%.3fs audible, playrate %.4f)" ..
         " covers the item (%.3fs) - not actually looped",
-        audible_iter, pr, len)
+        audible_iter, eff, len)
     end
   else
     diag = "loop: off (B_LOOPSRC not set)"
@@ -417,6 +456,8 @@ local function ProcessItem(item, R, temp_path, ctx)
   local old_bpm = TakeGridBPM(take)
   if not old_bpm then return "skip", "could not measure the take's grid" end
 
+  local eff_rate, ipr, tpr = GetEffectiveRate(item, take)
+
   local lbpm, lnum, lden = GetLocalTempoAtTime(pos)
 
   local start_offs = 0
@@ -428,12 +469,18 @@ local function ProcessItem(item, R, temp_path, ctx)
   local line1 = string.format(
     "item @ %.3fs len %.3fs: take grid %.3f BPM, local %.3f BPM (%d/%d), ratio %.4f",
     pos, len, old_bpm, lbpm, lnum, lden, lbpm / old_bpm)
+  if math.abs(eff_rate - 1.0) > CONFIG.tolerance then
+    line1 = line1 .. string.format(
+      ", playback rate %.4f (item %.3f x take %.3f, baked ~%.3f BPM)",
+      eff_rate, ipr, tpr, old_bpm / eff_rate)
+  end
   if start_offs > 0.0005 then
     line1 = line1 .. string.format(", take offset %.3fs (shared source)", start_offs)
   end
 
   if CONFIG.skip_if_conforms and not CONFIG.force_rebuild then
-    local conforms, why = TakeConforms(take, pos, lbpm, lnum, lden, R, old_bpm)
+    local conforms, why = TakeConforms(take, pos, lbpm, lnum, lden, R,
+                                       old_bpm, eff_rate)
     if conforms then
       return "same", line1 .. "\n      already conforms (" .. why .. ") - left untouched"
     end
@@ -511,6 +558,9 @@ local function ProcessItem(item, R, temp_path, ctx)
   reaper.SetMediaItemInfo_Value(final_item, "D_MUTE", imute)
   reaper.SetMediaItemInfo_Value(final_item, "D_VOL", ivol)
   reaper.SetMediaItemInfo_Value(final_item, "I_CUSTOMCOLOR", icol)
+  -- the fresh item plays at rate 1.0: any rate compensation of the
+  -- original has been absorbed by re-baking at the local tempo and
+  -- re-timing the notes through their audible positions
 
   local final_take = reaper.GetActiveTake(final_item)
   if not final_take then
@@ -691,10 +741,14 @@ local function ProcessItem(item, R, temp_path, ctx)
 
   -- soft notes -> verbose only
   local notes_txt = ""
+  if math.abs(eff_rate - 1.0) > CONFIG.tolerance then
+    notes_txt = notes_txt .. string.format(
+      "\n      rate normalized: %.4f -> 1.0000 (baked ~%.3f -> %.3f BPM)",
+      eff_rate, old_bpm / eff_rate, final_grid or lbpm)
+  end
   if loopsrc == 1 and not is_looped then
     notes_txt = notes_txt ..
-      "\n      note: B_LOOPSRC was on but the loop analysis said 'not looped'" ..
-      " - run with verbose = true for the raw numbers"
+      "\n      note: B_LOOPSRC was on but the loop analysis said 'not looped'"
   end
   if dropped > 0 then
     notes_txt = notes_txt .. string.format(
@@ -903,14 +957,16 @@ local function Main()
 
   if CONFIG.verbose then
     if reaper.ClearConsole then reaper.ClearConsole() end
-    reaper.ShowConsoleMsg("Local BPM unified (v16): rebuild selected items + insert blank local item\n")
+    reaper.ShowConsoleMsg("Local BPM unified: rebuild selected items + insert blank local item\n")
     reaper.ShowConsoleMsg(string.format(
-      "PPQ %d | SWS %s | glue: %s (required) | skip conforming: %s (meter: %s)" ..
-      " | quantize: %s | insert w/o track: %s (spawns new track)\n",
+      "PPQ %d | SWS %s | glue: %s (required) | skip conforming: %s (meter: %s," ..
+      " rate normalization: %s) | quantize: %s | insert w/o track: %s (spawns new track)\n",
       R, have_sws and "found" or "NOT found",
       CONFIG.use_glue and "on" or "OFF (!!)",
       CONFIG.skip_if_conforms and "yes" or "no",
-      CONFIG.check_meter and "on" or "off", CONFIG.quantize,
+      CONFIG.check_meter and "on" or "off",
+      CONFIG.normalize_playrate and "on" or "off",
+      CONFIG.quantize,
       CONFIG.insert_when_no_track_selected and "yes" or "no"))
     reaper.ShowConsoleMsg(string.format(
       "invocation: %d selected item(s), time selection %s\n\n",

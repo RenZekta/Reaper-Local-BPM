@@ -19,6 +19,9 @@ REAPER projects configured with a **Time** timebase have two long-standing quirk
 **2. Existing items can't change their baked tempo.**
 A MIDI take's tempo is fixed when the take is created, and there is no API to change it afterwards. Drag an item from a 92 BPM region into a 162 BPM region and its grid still runs at 92 — the editor grid is wrong and notes sit at meaningless bar:beat positions.
 
+**3. Manual fixes leave hidden compensations.**
+The standard workaround — typing the correct BPM into the corrupted item's properties and changing the playback-rate compensation on the *take* (e.g. `0.793750` after a 127 → 160 fix). The item sounds right, but it now carries a non-1.0 playback rate and a source shorter than the item — so it reads as looped when it isn't, and every future edit inherits the confusion.
+
 ## The Solution
 
 Both problems get the same cure: a compliant SMF (Standard MIDI File) containing the correct local tempo and time signature meta-events is compiled in a temp cache, imported as an external asset, and run through a stabilization chain — `timebase = Time → SWS ignore-tempo → convert to in-project → glue` — which forces REAPER to bake the local tempo and time signature into the take. PPQ resolution follows your `miditicksperqn` preference; new-track automation follows `launchnewtrkmode`.
@@ -27,6 +30,8 @@ Both problems get the same cure: a compliant SMF (Standard MIDI File) containing
 - **Rebuild path:** before the swap, every note, CC, text and sysex event of the original item is captured as an *audible timeline position*. After the rebuild, the events are re-injected through the finished take's own PPQ↔time mapping — the grid now runs at the local BPM while playback stays identical (a built-in verification measures the drift of every note, before the optional grid snap cleans up the fractional ticks left by non-integer tempo ratios).
 
 Loops survive: a looped item is rebuilt as one corrected iteration, then the item's length and loop flag are restored — including partial final iterations. Items that already conform to the local tempo are detected and left untouched, so the action is safe on mass selections and safe to run twice.
+
+Playback-rate compensations are normalized: the effective rate of a MIDI item is its item rate multiplied by its take rate — that's where REAPER stores the compensation when a MIDI item's BPM is changed via item properties — and any item whose effective rate differs from 1.0 is rebuilt to run at the local tempo with rate 1.0, notes at their exact audible positions. An item only counts as "already correct" when its effective grid matches the local tempo *and* its rate is 1.0, so compensated items are caught even when they sound right.
 
 ## Requirements
 
@@ -56,7 +61,7 @@ With a track selected, the item is created on that track. With no track selected
 1. **Select one or more MIDI items.**
 2. Run the action.
 
-Items whose internal tempo doesn't match the local tempo are rebuilt — notes keep their audible positions. Items that already conform are skipped untouched. Looped items keep their loops.
+Items whose internal tempo doesn't match the local tempo — or whose playback rate carries a tempo compensation — are rebuilt; notes keep their audible positions.
 
 ### Both at once
 With items selected *and* a time selection active, both paths run in a single invocation: the selected items are rebuilt, and a blank local item is inserted.
@@ -70,12 +75,14 @@ Notable `CONFIG` options (all documented inline):
 | Option | Default | Description |
 | --- | --- | --- |
 | `check_meter` | `false` | Rebuild only on tempo mismatch. Leave off for polyrhythm workflows that deliberately mix meters within a bar; set `true` to also fix baked time signatures. |
+| `normalize_playrate` | `true` | Rebuild items carrying a playback-rate compensation (effective rate ≠ 1.0) so they run at the local tempo at rate 1.0 — notes keep their audible positions. Set `false` if you use playback rates as a deliberate creative effect. |
 | `quantize` | `"grid"` | Post-rebuild snap: `"grid"` (MIDI editor grid), `"tick"` (whole ticks only, sub-0.05 ms movement), or `"off"`. |
 | `preserve_loops` | `true` | Rebuild looped items as one corrected iteration and restore the loop afterwards. |
 | `skip_if_conforms` | `true` | Leave items already matching the local tempo completely untouched. |
 | `insert_when_no_track_selected` | `true` | The insert path spawns a new track when no track is selected. |
 | `consume_selection_after_insert` | `false` | Restore the time selection after an insert. |
 | `use_glue` | `true` | **Leave on** — the glue step is required for the tempo bake to survive the import chain. |
+
 
 ## Known Limitations
 
