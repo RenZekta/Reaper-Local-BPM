@@ -13,22 +13,28 @@
   PATH A - REBUILD selected MIDI items
     Selected MIDI items whose internal (baked) tempo does not match the
     local tempo at their position are rebuilt to run at the local BPM:
+      * before any tempo decision, boundaries sitting in the wrong
+        tempo region are snapped onto the region marker with
+        take-offset compensation - down to sub-microsecond straddles
+        (a boundary grazing a marker makes the item read as sitting in
+        the PREVIOUS region, causing false rebuilds and errors)
       * every note / CC / text / sysex event keeps its exact audible
         timeline position (re-measured afterwards; drift is reported)
-      * looped items are rebuilt as ONE corrected iteration, then the
-        loop is restored - including a partial final iteration
       * playback-rate compensations are normalized: the effective rate
         is item D_PLAYRATE x take D_PLAYRATE (changing a MIDI item's
         BPM via item properties stores the compensation in the TAKE
         rate), and any item whose rate differs from 1.0 is rebuilt at
         the local tempo with rate 1.0 - audible positions preserved
+      * looped items are rebuilt as ONE corrected iteration, then the
+        loop is restored - including a partial final iteration
       * items that already conform (effective grid = local tempo, rate
         1.0) are left completely untouched - safe on mass selections,
         safe to re-run
       * an optional grid-snap pass cleans the fractional ticks left
         by non-integer tempo ratios
-    Items with multiple takes, and looped split pieces sharing a MIDI
-    source (non-zero take offset), are skipped with an explanation.
+    Items with multiple takes and looped split pieces sharing a MIDI
+    source (non-zero take offset) are skipped with an explanation;
+    straddles beyond snap_straddle_ms are reported, not forced.
 
   PATH B - INSERT a blank MIDI item into the active time selection
     A new MIDI item is created across the time selection with the local
@@ -59,6 +65,8 @@
   CONFIGURATION: see the CONFIG table below. Notables:
     verbose (default false)        fully silent except ERROR lines;
                                    true = full per-item diagnostic report
+    snap_boundaries (true)         fix boundaries sitting in the wrong
+                                   tempo region before reading it
     normalize_playrate (true)      rebuild items carrying a playback-
                                    rate compensation so they run at
                                    rate 1.0 (audible positions kept)
@@ -80,6 +88,13 @@ local CONFIG = {
   normalize_playrate = true,  -- rebuild items with a playback-rate
                               -- compensation (rate != 1.0), normalizing
                               -- them to the local tempo at rate 1.0
+
+  snap_boundaries   = true,   -- fix start/end boundaries that sit in the wrong
+                              -- tempo region (sub-us straddles up to 250 ms),
+                              -- before reading the local tempo
+  snap_straddle_ms  = 250,    -- max leading/trailing sliver auto-trimmed
+  snap_dust_ms      = 20,     -- float-dust grid/marker snap threshold
+  
   use_glue         = true,    -- REQUIRED, see header
   preserve_loops   = true,
   quantize         = "grid",  -- "grid" | "tick" | "off"
@@ -141,6 +156,195 @@ local function GetEffectiveRate(item, take)
   end
   return ipr * tpr, ipr, tpr
 end
+
+-- ============ boundary snapping (Phase 0) ============
+
+-- reads exactly like the local-tempo lookup below it
+local function LocalTempoReadAt(t)
+  local bpm, num, den
+  if reaper.FindTempoTimeSigMarker then
+    local idx = reaper.FindTempoTimeSigMarker(0, t) or -1
+    if idx >= 0 then
+      local _, _, _, _, b, n, d = reaper.GetTempoTimeSigMarker(0, idx)
+      if b and b > 0 then bpm = b end
+      if n and n >= 1 and d and d >= 1 then num, den = n, d end
+    end
+  end
+  if not bpm and reaper.TimeMap2_GetDividedBpmAtTime then
+    local v = reaper.TimeMap2_GetDividedBpmAtTime(0, t)
+    if v and v > 0 then bpm = v end
+  end
+  if not bpm and reaper.Master_GetTempo then bpm = reaper.Master_GetTempo() end
+  if not bpm or bpm <= 0 then bpm = 120.0 end
+  if not num or not den then num, den = 4, 4 end
+  return bpm, num, den
+end
+
+local function BodyTempo(pos, len)
+  local counts, first_sig = {}, {}
+  for k = 1, 9 do
+    local t = pos + len * k / 10.0
+    local bpm, num, den = LocalTempoReadAt(t)
+    local key = string.format("%.3f", bpm)
+    counts[key] = (counts[key] or 0) + 1
+    if not first_sig[key] then first_sig[key] = { num, den } end
+  end
+  local bestKey, bestN = nil, 0
+  for key, c in pairs(counts) do
+    if c > bestN then bestKey, bestN = key, c end
+  end
+  local bpm = tonumber(bestKey) or 120.0
+  local sig = first_sig[bestKey] or { 4, 4 }
+  return bpm, sig[1], sig[2], bestN
+end
+
+local function MarkersInside(a, b)
+  local list = {}
+  if reaper.CountTempoTimeSigMarkers then
+    local n = reaper.CountTempoTimeSigMarkers(0)
+    for i = 0, n - 1 do
+      local ok, mtime, qnpos, sortpos, mbpm, mnum, mden =
+        reaper.GetTempoTimeSigMarker(0, i)
+      if ok and type(mtime) == "number" and mtime > a and mtime <= b then
+        list[#list + 1] = { t = mtime, bpm = mbpm, num = mnum, den = mden }
+      end
+    end
+  end
+  table.sort(list, function(x, y) return x.t < y.t end)
+  return list
+end
+
+local function BestDustTarget(t)
+  local thr = CONFIG.snap_dust_ms / 1000.0
+  if reaper.CountTempoTimeSigMarkers then
+    local n = reaper.CountTempoTimeSigMarkers(0)
+    local best_m, best_d = nil, math.huge
+    for i = 0, n - 1 do
+      local ok, mtime = reaper.GetTempoTimeSigMarker(0, i)
+      if ok and type(mtime) == "number" then
+        local d = math.abs(mtime - t)
+        if d <= thr and d < best_d then best_m, best_d = mtime, d end
+      end
+    end
+    if best_m then return best_m, "marker" end
+  end
+  local t2qn = reaper.TimeMap_timeToQN
+  local qn2t = reaper.TimeMap_QNToTime
+  if t2qn and qn2t then
+    local qn = t2qn(t)
+    if type(qn) == "number" then
+      local k = math.floor(qn / 0.25 + 0.5)
+      local gt = qn2t(math.max(0, k * 0.25))
+      if type(gt) == "number" then
+        local d = math.abs(gt - t)
+        if d <= thr then return gt, "grid 1/16" end
+      end
+    end
+  end
+  return nil
+end
+
+-- Phase 0: snap boundaries that sit in the wrong tempo region (or off
+-- the grid by dust), with take-offset compensation. Returns a report
+-- line for verbose mode (nil when nothing changed).
+local function SnapBoundaries(item, take)
+  local pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+  local len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+  if len <= 0.001 then return nil end
+  local end_t = pos + len
+
+  local offs = 0
+  if reaper.GetMediaItemTakeInfo_Value then
+    offs = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS") or 0
+  end
+
+  local bpm_s = LocalTempoReadAt(pos)
+  local bpm_b, num_b, den_b, votes = BodyTempo(pos, len)
+  local bpm_e = LocalTempoReadAt(end_t)
+  local inside = MarkersInside(pos, end_t)
+  local body_ok = (votes >= 5)
+
+  local new_pos, new_end, moved = pos, end_t, false
+  local report = {}
+  local thr = CONFIG.snap_straddle_ms / 1000.0
+
+  -- START: sits in the wrong region -> snap onto the body-region marker
+  if body_ok and math.abs(bpm_s - bpm_b) > 0.01 then
+    for _, m in ipairs(inside) do
+      if math.abs(LocalTempoReadAt(m.t + 0.001) - bpm_b) <= 0.01 then
+        local sliver = m.t - pos
+        if sliver > 0 and sliver <= thr then
+          new_pos = m.t
+          moved = true
+          report[#report + 1] = string.format(
+            "start snap %+.6f ms onto region %.3f (read %.3f -> %.3f BPM)",
+            sliver * 1000.0, bpm_b, bpm_s, bpm_b)
+        elseif sliver > thr then
+          report[#report + 1] = string.format(
+            "start straddles by %.1f ms (over %d ms threshold) - not snapped",
+            sliver * 1000.0, CONFIG.snap_straddle_ms)
+        end
+        break
+      end
+    end
+  else
+    -- dust snap only
+    local t, kind = BestDustTarget(pos)
+    if t and t >= 0 and math.abs(t - pos) > 0.000001 then
+      new_pos = t
+      moved = true
+      report[#report + 1] = string.format(
+        "start dust snap %+.1f ms (%s)", (t - pos) * 1000.0, kind)
+    end
+  end
+
+  -- END: sits in the next region -> snap back onto its marker
+  if body_ok and math.abs(bpm_e - bpm_b) > 0.01 then
+    for i = #inside, 1, -1 do
+      local m = inside[i]
+      if math.abs(LocalTempoReadAt(m.t + 0.001) - bpm_e) <= 0.01 then
+        local sliver = end_t - m.t
+        if sliver > 0 and sliver <= thr then
+          new_end = m.t
+          moved = true
+          report[#report + 1] = string.format(
+            "end snap -%.6f ms onto region boundary (after-end read %.3f -> %.3f BPM)",
+            sliver * 1000.0, bpm_e, bpm_b)
+        elseif sliver > thr then
+          report[#report + 1] = string.format(
+            "end straddles by %.1f ms (over %d ms threshold) - not snapped",
+            sliver * 1000.0, CONFIG.snap_straddle_ms)
+        end
+        break
+      end
+    end
+  else
+    local t, kind = BestDustTarget(end_t)
+    if t and math.abs(t - end_t) > 0.000001 then
+      new_end = t
+      moved = true
+      report[#report + 1] = string.format(
+        "end dust snap %+.1f ms (%s)", (t - end_t) * 1000.0, kind)
+    end
+  end
+
+  if not moved then return nil end
+  local new_len = new_end - new_pos
+  if new_len <= 0.001 then
+    return "boundary snap SKIPPED: would collapse the item"
+  end
+
+  reaper.SetMediaItemInfo_Value(item, "D_POSITION", new_pos)
+  reaper.SetMediaItemInfo_Value(item, "D_LENGTH", new_len)
+  -- offset compensation: notes keep their exact audible positions,
+  -- same semantics as dragging the edge by hand
+  reaper.SetMediaItemTakeInfo_Value(take, "D_STARTOFFS", offs + (new_pos - pos))
+  if reaper.MarkProjectDirty then reaper.MarkProjectDirty() end
+
+  return "boundary snap: " .. table.concat(report, "; ")
+end
+
+-- ============ end boundary snapping ============
 
 -- create a new track at the end of the track list and select it
 local function SpawnTrackAtEnd()
@@ -451,6 +655,16 @@ local function ProcessItem(item, R, temp_path, ctx)
   local len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
   if len <= 0.001 then return "skip", "item has no length" end
 
+  -- PHASE 0: boundary snap BEFORE any tempo decisions, so the local
+  -- tempo is read from the region the item actually sits in
+  local snap_msg = nil
+  if CONFIG.snap_boundaries then
+    snap_msg = SnapBoundaries(item, take)
+    -- re-read: the snap may have moved the item
+    pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+    len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+  end
+
   local track = reaper.GetMediaItemTrack(item)
 
   local old_bpm = TakeGridBPM(take)
@@ -476,6 +690,9 @@ local function ProcessItem(item, R, temp_path, ctx)
   end
   if start_offs > 0.0005 then
     line1 = line1 .. string.format(", take offset %.3fs (shared source)", start_offs)
+  end
+  if snap_msg then
+    line1 = line1 .. "\n      " .. snap_msg
   end
 
   if CONFIG.skip_if_conforms and not CONFIG.force_rebuild then
